@@ -148,8 +148,11 @@ function BBLog_(userConfig) {
   this.maxRows;
   this.rollerRowCount;
   this.backupFolder         = null;
-  this.backupWholeSS;
-  this.sheetName;
+  this.backupWholeSS        = false;
+  this.sheetName            = DEFAULT_LOG_SHEET_NAME_;
+  // NEW: Custom fields support
+  this.customFields         = null;  // Object to store custom field values
+  this.customFieldHeaders   = null;  // Array of custom field header names
 
   var defaultConfig_ = {
     lock                 : null,   
@@ -168,6 +171,7 @@ function BBLog_(userConfig) {
     backupFolderId       : null,
     backupWholeSS        : false,
     useStackdriver       : true,
+    customFields         : null
   }
 
   // Overwrite defaults with user settings
@@ -189,6 +193,11 @@ function BBLog_(userConfig) {
   }
 
   this.minLevelToDisplay = defaultConfig_.level;
+  // NEW: Store custom fields configuration
+  if (defaultConfig_.customFields && typeof defaultConfig_.customFields === 'object') {
+    this.customFields = defaultConfig_.customFields;
+    this.customFieldHeaders = Object.keys(defaultConfig_.customFields);
+  } 
 
   if (defaultConfig_.firebaseUrl !== null) {
     
@@ -513,12 +522,10 @@ BBLog_.prototype.clear = function() {
   }
   
   if (this.localSheet !== null) {
-    this.localSheet.clearContents();
-    this.localSheet.getRange(1,1).setValue(SHEET_LOG_HEADER_);
-    this.localSheet.setFrozenRows(1);
-    this.localSheet.setColumnWidth(1, SHEET_LOG_CELL_WIDTH_);    
-    SpreadsheetApp.flush();
-  }
+      this.localSheet.clearContents();
+      this._setupSheetHeaders(); // CHANGED: Use new header setup function
+      SpreadsheetApp.flush();
+    }
   
   if (this.localFirebase === null && this.localSheet === null) {
     throw new Error('Set up the logging destination first')
@@ -553,6 +560,7 @@ BBLog_.prototype.remoteLogProxy = function(e) {
  
 BBLog_.prototype._useSpreadsheet = function(key, sheetName, hideLog) {
 
+  var self = this;
   var spreadsheet;
 
   if (typeof key !== 'undefined' && key !== '') {  
@@ -576,6 +584,7 @@ BBLog_.prototype._useSpreadsheet = function(key, sheetName, hideLog) {
   
   if (sheet === null) { 
     sheet = spreadsheet.insertSheet(sheetName, numberOfSheets);
+    this.localSheet = sheet;
     formatLog()
   }
 
@@ -583,7 +592,9 @@ BBLog_.prototype._useSpreadsheet = function(key, sheetName, hideLog) {
     sheet.hideSheet()
   }
 
-  sheet.getRange(1,1).setValue(SHEET_LOG_HEADER_); // In case we need to update
+  // Update headers in case custom fields changed
+  this.localSheet = sheet;
+  this._setupSheetHeaders();  
   return sheet
   
   // Private Functions
@@ -595,18 +606,26 @@ BBLog_.prototype._useSpreadsheet = function(key, sheetName, hideLog) {
     
   function formatLog() {
 
-    sheet.deleteColumns(2, sheet.getMaxColumns() - 1);
+    // Determine total number of columns (1 for message + custom fields)
+    var totalColumns = 1 + (self.customFieldHeaders ? self.customFieldHeaders.length : 0);
     
-    sheet
-      .getRange(1,1)
-      .setValue(SHEET_LOG_HEADER_)
-      .setFontWeight('bold')
-      .setBackground('grey')
-      .setFontColor('white');
-      
+    // Delete extra columns if needed
+    if (sheet.getMaxColumns() > totalColumns) {
+      sheet.deleteColumns(totalColumns + 1, sheet.getMaxColumns() - totalColumns);
+    }
+    
+    // Setup headers
+    self._setupSheetHeaders();
+    
     sheet.setFrozenRows(1);
+    sheet.setColumnWidth(1, SHEET_LOG_CELL_WIDTH_);
     
-    sheet.setColumnWidth(1, SHEET_LOG_CELL_WIDTH_);    
+    // Set custom field column widths
+    if (self.customFieldHeaders) {
+      for (var i = 0; i < self.customFieldHeaders.length; i++) {
+        sheet.setColumnWidth(i + 2, 200); // Columns B, C, etc.
+      }
+    }   
 
     var conditionalFormatRules = sheet.getConditionalFormatRules();
     
@@ -634,6 +653,25 @@ BBLog_.prototype._useSpreadsheet = function(key, sheetName, hideLog) {
   
 } // BBLog_.useSpreadsheet_()
 
+/**
+ * NEW: Setup sheet headers including custom fields
+ */
+BBLog_.prototype._setupSheetHeaders = function() {
+  if (!this.localSheet) return;
+  
+  var headers = [SHEET_LOG_HEADER_];
+  
+  // Add custom field headers
+  if (this.customFieldHeaders && this.customFieldHeaders.length > 0) {
+    headers = headers.concat(this.customFieldHeaders);
+  }
+  
+  var headerRange = this.localSheet.getRange(1, 1, 1, headers.length);
+  headerRange.setValues([headers]);
+  headerRange.setFontWeight('bold');
+  headerRange.setBackground('grey');
+  headerRange.setFontColor('white');
+}
 /**
  * Record the id of the active user
  *
@@ -795,7 +833,7 @@ BBLog_.prototype._log = function(oldArgs, level) {
   // Private Functions
   // -----------------
   
-  function logToSheet(shortMessage, level) {
+function logToSheet(shortMessage, level) {
   
     if (self._incCallCountToSheetLog() % self.rollerRowCount === 0) {
       self._rollLogOver();
@@ -803,8 +841,18 @@ BBLog_.prototype._log = function(oldArgs, level) {
     
     var longMessage = convertUsingDefaultPatternLayout(shortMessage, level);
     
-    if (self.useRemoteLogger) {
+    // Build row data: [message, customField1, customField2, ...]
+    var rowData = [longMessage];
     
+    // NEW: Add custom field values
+    if (self.customFields && self.customFieldHeaders) {
+      for (var i = 0; i < self.customFieldHeaders.length; i++) {
+        var fieldName = self.customFieldHeaders[i];
+        rowData.push(self.customFields[fieldName] || '');
+      }
+    }
+    
+    if (self.useRemoteLogger) {
       var url = ScriptApp.getService().getUrl()+'?betterlogmsg=' + longMessage;
       
       Utils_.callWithBackoff(function() {
@@ -814,7 +862,7 @@ BBLog_.prototype._log = function(oldArgs, level) {
     } else {
     
       Utils_.callWithBackoff(function() {      
-        self.localSheet.appendRow([longMessage]);
+        self.localSheet.appendRow(rowData);  // CHANGED: Use rowData instead of [longMessage]
       });
     }
     
@@ -967,7 +1015,7 @@ BBLog_.prototype._rollLogOver = function() {
   
   // prep the live log
   this.localSheet.deleteRows(2, this.localSheet.getMaxRows() - 2);
-  this.localSheet.getRange(1,1).setValue(SHEET_LOG_HEADER_);
+  this._setupSheetHeaders();
   
   // update the log
   this.localSheet
